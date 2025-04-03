@@ -340,7 +340,7 @@ app.use(express.static(path.join(__dirname, "public")));
 startPeriodicSync();
 
 // Запуск сервера
-const PORT = process.env.PORT || 3002;
+const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
   console.log(`Сервер запущен на порту ${PORT}`);
 });
