@@ -1,4 +1,4 @@
-// server.js - Серверная часть для Air Hockey
+// server.js - Серверная часть для Air Hockey с оптимизацией плавности
 const express = require("express");
 const http = require("http");
 const { Server } = require("socket.io");
@@ -19,26 +19,20 @@ app.use(
   })
 );
 
-// Настройка Socket.IO с оптимизированными параметрами
+// Настройка Socket.IO с улучшенными параметрами для уменьшения задержки
 const io = new Server(server, {
   cors: {
     origin: "*",
     methods: ["GET", "POST"],
     allowedHeaders: ["*"],
   },
-  // Оптимизированные настройки Socket.IO
-  pingInterval: 10000, // Проверка соединения каждые 2 секунды
-  pingTimeout: 5000, // Считать отключенным после 5 секунд
-  transports: ["websocket", "polling"], // Принудительно использовать WebSocket (эффективнее чем polling)
-  maxHttpBufferSize: 1e6, // 1 МБ размер буфера (по умолчанию 1 МБ)
-  connectionStateRecovery: {
-    // Настройки восстановления соединения
-    maxDisconnectionDuration: 2 * 60 * 1000, // 2 минуты
-    skipMiddlewares: true,
-  },
+  // Оптимизированные настройки для минимизации задержки
+  pingInterval: 5000, // Более частая проверка соединения (каждые 5 секунд)
+  pingTimeout: 3000, // Более быстрая реакция на отключение
+  transports: ["websocket"], // Использовать только WebSocket для минимальной задержки
+  maxHttpBufferSize: 1e5, // Уменьшение размера буфера для более быстрой передачи
   perMessageDeflate: {
-    // Включить сжатие
-    threshold: 1024, // Сжимать только данные больше 1 КБ
+    threshold: 512, // Сжимать более мелкие сообщения для быстрой передачи
   },
 });
 
@@ -51,12 +45,13 @@ const PUCK_RADIUS = 20;
 const GOAL_WIDTH = 120;
 const WINNING_SCORE = 10;
 
-// Константы физики
-const FRICTION = 0.994; // Трение шайбы - уменьшено для соответствия клиенту
-const AIR_RESISTANCE = 0.9995; // Сопротивление воздуха - соответствует клиентской реализации
-const BOARD_RESTITUTION = 0.95; // Сохранение энергии при отскоке
-const MIN_VELOCITY = 0.3; // Минимальная скорость перед остановкой
-const UPDATE_RATE = 1000; // Частота обновления сервера в мс (~60 FPS)
+// Константы физики для более плавного движения
+const FRICTION = 0.997; // Слегка уменьшенное трение для более плавного скольжения
+const AIR_RESISTANCE = 0.9998; // Уменьшенное сопротивление воздуха
+const BOARD_RESTITUTION = 0.97; // Увеличенное сохранение энергии при отскоке
+const MIN_VELOCITY = 0.2; // Меньший порог минимальной скорости
+const MAX_SPEED = 30; // Максимальная скорость шайбы
+const UPDATE_RATE = 16; // ~60 FPS для максимальной плавности (16.67ms)
 
 // Получить или создать матч по ID
 function getOrCreateMatch(matchId) {
@@ -69,8 +64,16 @@ function getOrCreateMatch(matchId) {
       lastUpdateTime: Date.now(),
       updateInterval: null,
       lastSyncTime: Date.now(),
-      collisionHistory: [], // Отслеживание недавних столкновений для избежания дубликатов
-      goalCooldown: false, // Предотвращает множественные события гола
+      collisionHistory: [],
+      goalCooldown: false,
+      // История позиций для интерполяции
+      positionHistory: {
+        puck: [],
+        player1: [],
+        player2: [],
+      },
+      // Сохранение предыдущего состояния для сглаживания
+      previousState: null,
       gameState: {
         puckPos: { x: 0, y: 0 },
         puckVelocity: { x: 0, y: 0 },
@@ -106,30 +109,36 @@ function resetPositions(match) {
   // Сбросить скорость шайбы в ноль ПЕРЕД обновлением позиции для согласованности
   gameState.puckVelocity = { x: 0, y: 0 };
 
-  // Округлить позиции до целых чисел для более согласованной синхронизации
+  // Точные позиции (не округлять для более плавного движения)
   gameState.puckPos = {
-    x: Math.round(width / 2),
-    y: Math.round(height / 2),
+    x: width / 2,
+    y: height / 2,
   };
 
   // Игрок 1 в нижнем центре
   gameState.player1Pos = {
-    x: Math.round(width / 2),
-    y: Math.round(height * 0.75),
+    x: width / 2,
+    y: height * 0.75,
   };
 
   // Игрок 2 в верхнем центре
   gameState.player2Pos = {
-    x: Math.round(width / 2),
-    y: Math.round(height * 0.25),
+    x: width / 2,
+    y: height * 0.25,
   };
 
   // Установить временную метку сброса
   gameState.lastResetTime = Date.now();
   gameState.lastUpdateTime = Date.now();
 
-  // Очистить историю столкновений при сбросе
+  // Очистить историю столкновений и позиций при сбросе
   match.collisionHistory = [];
+  match.positionHistory = {
+    puck: [],
+    player1: [],
+    player2: [],
+  };
+  match.previousState = null;
 
   return true;
 }
@@ -148,7 +157,7 @@ function resetGame(match) {
   return true;
 }
 
-// Более строгие ограничения позиции игрока
+// Улучшенные ограничения позиции игрока без округления для плавности
 function enforcePlayerConstraints(match, playerNumber, position) {
   const { canvasSize } = match.gameState;
 
@@ -160,41 +169,34 @@ function enforcePlayerConstraints(match, playerNumber, position) {
     return position;
   }
 
-  // Округлить координаты для согласованности между клиентом и сервером
-  let newX = Math.round(
-    Math.max(
-      PLAYER_RADIUS,
-      Math.min(position.x, canvasSize.width - PLAYER_RADIUS)
-    )
+  // Применить ограничения без округления координат
+  let newX = Math.max(
+    PLAYER_RADIUS,
+    Math.min(position.x, canvasSize.width - PLAYER_RADIUS)
   );
 
   let newY;
   if (playerNumber === 1) {
-    // Игрок 1 ограничен нижней половиной (с небольшим буфером)
-    newY = Math.round(
-      Math.max(
-        canvasSize.height / 2 + PLAYER_RADIUS,
-        Math.min(position.y, canvasSize.height - PLAYER_RADIUS)
-      )
+    // Игрок 1 ограничен нижней половиной
+    newY = Math.max(
+      canvasSize.height / 2 + PLAYER_RADIUS,
+      Math.min(position.y, canvasSize.height - PLAYER_RADIUS)
     );
   } else {
-    // Игрок 2 ограничен верхней половиной (с небольшим буфером)
-    newY = Math.round(
-      Math.min(
-        canvasSize.height / 2 - PLAYER_RADIUS,
-        Math.max(position.y, PLAYER_RADIUS)
-      )
+    // Игрок 2 ограничен верхней половиной
+    newY = Math.min(
+      canvasSize.height / 2 - PLAYER_RADIUS,
+      Math.max(position.y, PLAYER_RADIUS)
     );
   }
 
   return { x: newX, y: newY };
 }
 
-// Улучшенная проверка окончания игры с надежной валидацией
+// Проверка окончания игры
 function checkGameOver(match) {
   const { gameState } = match;
 
-  // Проверка безопасности
   if (!gameState) return false;
 
   // Проверить наличие победного счета
@@ -213,16 +215,133 @@ function checkGameOver(match) {
   return false;
 }
 
-// Улучшенный физический движок с улучшенным обнаружением столкновений
+// Вспомогательная функция для проверки столкновения шайбы с игроком
+function checkPuckPlayerCollision(puckPos, playerPos) {
+  const dx = puckPos.x - playerPos.x;
+  const dy = puckPos.y - playerPos.y;
+  const distance = Math.sqrt(dx * dx + dy * dy);
+
+  return distance < PUCK_RADIUS + PLAYER_RADIUS;
+}
+
+// Функция для обработки столкновения шайбы с игроком
+function handlePlayerCollision(match, playerNumber) {
+  const { gameState } = match;
+  const puckPos = gameState.puckPos;
+  const playerPos =
+    playerNumber === 1 ? gameState.player1Pos : gameState.player2Pos;
+
+  // Создать уникальный ID столкновения
+  const collisionId = `${playerNumber}_${Date.now()}`;
+
+  // Проверить, обрабатывали ли мы уже это столкновение
+  if (match.collisionHistory.includes(collisionId)) {
+    return false;
+  }
+
+  // Добавить в историю и ограничить размер истории
+  match.collisionHistory.push(collisionId);
+  if (match.collisionHistory.length > 10) {
+    match.collisionHistory.shift();
+  }
+
+  // Вектор от игрока к шайбе
+  const dx = puckPos.x - playerPos.x;
+  const dy = puckPos.y - playerPos.y;
+  const distance = Math.sqrt(dx * dx + dy * dy);
+
+  // Предотвратить деление на ноль
+  if (distance === 0) return false;
+
+  // Нормализованный вектор
+  const nx = dx / distance;
+  const ny = dy / distance;
+
+  // Отодвинуть шайбу от игрока (избежать застревания)
+  gameState.puckPos.x = playerPos.x + nx * (PLAYER_RADIUS + PUCK_RADIUS + 1);
+  gameState.puckPos.y = playerPos.y + ny * (PLAYER_RADIUS + PUCK_RADIUS + 1);
+
+  // Рассчитать импульс от игрока к шайбе
+  // Используем скорость игрока, если она доступна
+  let playerSpeed = 0;
+  const playerVelocity = { x: 0, y: 0 };
+
+  // Имитация скорости игрока на основе истории позиций
+  if (match.positionHistory[`player${playerNumber}`].length >= 2) {
+    const history = match.positionHistory[`player${playerNumber}`];
+    const current = history[history.length - 1];
+    const previous = history[history.length - 2];
+
+    if (current && previous && current.timestamp !== previous.timestamp) {
+      const dt = (current.timestamp - previous.timestamp) / 1000;
+      if (dt > 0) {
+        playerVelocity.x = (current.pos.x - previous.pos.x) / dt;
+        playerVelocity.y = (current.pos.y - previous.pos.y) / dt;
+        playerSpeed = Math.sqrt(
+          playerVelocity.x * playerVelocity.x +
+            playerVelocity.y * playerVelocity.y
+        );
+      }
+    }
+  }
+
+  // Применить импульс от игрока к шайбе
+  const IMPACT_FACTOR = 1.5; // Увеличенный фактор удара для более динамичной игры
+  const baseVelocity = 10; // Базовая скорость при ударе
+
+  // Использовать скорость игрока, если она достаточно большая
+  if (playerSpeed > 5) {
+    gameState.puckVelocity.x = playerVelocity.x * IMPACT_FACTOR;
+    gameState.puckVelocity.y = playerVelocity.y * IMPACT_FACTOR;
+  } else {
+    // Иначе использовать направление от игрока к шайбе
+    gameState.puckVelocity.x = nx * baseVelocity;
+    gameState.puckVelocity.y = ny * baseVelocity;
+  }
+
+  // Добавить небольшую случайность к отскоку для реалистичности
+  const randomFactor = 1 + (Math.random() * 0.1 - 0.05); // ±5% вариация
+  gameState.puckVelocity.x *= randomFactor;
+  gameState.puckVelocity.y *= randomFactor;
+
+  // Ограничить максимальную скорость
+  const speed = Math.sqrt(
+    gameState.puckVelocity.x * gameState.puckVelocity.x +
+      gameState.puckVelocity.y * gameState.puckVelocity.y
+  );
+
+  if (speed > MAX_SPEED) {
+    const scaleFactor = MAX_SPEED / speed;
+    gameState.puckVelocity.x *= scaleFactor;
+    gameState.puckVelocity.y *= scaleFactor;
+  }
+
+  return true;
+}
+
+// Улучшенный физический движок с предсказанием столкновений и сглаживанием
 function updatePuckPhysics(match) {
   const { gameState } = match;
   const now = Date.now();
-  const deltaTime = Math.min((now - gameState.lastUpdateTime) / 1000, 0.1); // Ограничение до 100мс для предотвращения скачков
+
+  // Измерение реального времени между кадрами для стабильной физики
+  const deltaTime = Math.min((now - gameState.lastUpdateTime) / 1000, 0.05); // Ограничение до 50мс
   gameState.lastUpdateTime = now;
 
   // Пропустить физику, если игра не в процессе
   if (!gameState.isPlaying || gameState.gameOver || match.goalCooldown)
     return false;
+
+  // Сохранить предыдущее состояние для интерполяции
+  if (!match.previousState) {
+    match.previousState = {
+      puckPos: { ...gameState.puckPos },
+      puckVelocity: { ...gameState.puckVelocity },
+    };
+  } else {
+    match.previousState.puckPos = { ...gameState.puckPos };
+    match.previousState.puckVelocity = { ...gameState.puckVelocity };
+  }
 
   // Применить правильные множители трения и сопротивления воздуха
   const frictionFactor = Math.pow(FRICTION, deltaTime);
@@ -237,148 +356,192 @@ function updatePuckPhysics(match) {
     gameState.puckVelocity.x * gameState.puckVelocity.x +
       gameState.puckVelocity.y * gameState.puckVelocity.y
   );
+
   if (currentSpeed < MIN_VELOCITY) {
     gameState.puckVelocity.x = 0;
     gameState.puckVelocity.y = 0;
+
+    // Добавить в историю позиций для интерполяции
+    match.positionHistory.puck.push({
+      pos: { ...gameState.puckPos },
+      timestamp: now,
+    });
+
+    // Ограничить историю
+    if (match.positionHistory.puck.length > 10) {
+      match.positionHistory.puck.shift();
+    }
+
     return false; // Нет необходимости продолжать обновление физики
-  } else if (currentSpeed < 3) {
-    // Применить дополнительное замедление на низких скоростях для более плавной остановки
-    const slowdownFactor = 0.98;
-    gameState.puckVelocity.x *= slowdownFactor;
-    gameState.puckVelocity.y *= slowdownFactor;
   }
 
   // Вычислить новую позицию, используя текущую скорость
-  const newX = gameState.puckPos.x + gameState.puckVelocity.x * deltaTime * 60; // Нормализация для 60 FPS
-  const newY = gameState.puckPos.y + gameState.puckVelocity.y * deltaTime * 60;
+  // Нормализуем для стабильного шага физики независимо от FPS
+  const stepFactor = deltaTime * 60; // Нормализация для 60 FPS
+  const newX = gameState.puckPos.x + gameState.puckVelocity.x * stepFactor;
+  const newY = gameState.puckPos.y + gameState.puckVelocity.y * stepFactor;
 
   // Флаг обнаружения столкновения
   let collisionOccurred = false;
 
-  // Обработать столкновения со стенами
-  const { width, height } = gameState.canvasSize;
-
-  // Сначала проверить столкновения с углами для специальной обработки
-  const isInCorner = checkCornerCollision(
-    newX,
-    newY,
-    PUCK_RADIUS,
-    width,
-    height
+  // Проверить столкновения с игроками (сначала)
+  const player1Collision = checkPuckPlayerCollision(
+    { x: newX, y: newY },
+    gameState.player1Pos
   );
-  if (isInCorner.collision) {
-    handleCornerCollision(match, isInCorner.corner);
+
+  const player2Collision = checkPuckPlayerCollision(
+    { x: newX, y: newY },
+    gameState.player2Pos
+  );
+
+  if (player1Collision) {
+    handlePlayerCollision(match, 1);
+    collisionOccurred = true;
+  } else if (player2Collision) {
+    handlePlayerCollision(match, 2);
     collisionOccurred = true;
   } else {
-    // Левая стена
-    if (newX - PUCK_RADIUS < 0) {
-      gameState.puckPos.x = PUCK_RADIUS + 1; // Немного отодвинуть от стены
-      gameState.puckVelocity.x = -gameState.puckVelocity.x * BOARD_RESTITUTION;
+    // Обработать столкновения со стенами
+    const { width, height } = gameState.canvasSize;
 
-      // Обеспечить минимальную скорость отскока, чтобы предотвратить прилипание
-      if (Math.abs(gameState.puckVelocity.x) < 2) {
-        gameState.puckVelocity.x = Math.sign(gameState.puckVelocity.x) * 2;
-      }
+    // Сначала проверить столкновения с углами для специальной обработки
+    const isInCorner = checkCornerCollision(
+      newX,
+      newY,
+      PUCK_RADIUS,
+      width,
+      height
+    );
 
+    if (isInCorner.collision) {
+      handleCornerCollision(match, isInCorner.corner);
       collisionOccurred = true;
-    }
-    // Правая стена
-    else if (newX + PUCK_RADIUS > width) {
-      gameState.puckPos.x = width - PUCK_RADIUS - 1;
-      gameState.puckVelocity.x = -gameState.puckVelocity.x * BOARD_RESTITUTION;
+    } else {
+      // Обработка столкновений с боковыми стенками
 
-      if (Math.abs(gameState.puckVelocity.x) < 2) {
-        gameState.puckVelocity.x = Math.sign(gameState.puckVelocity.x) * 2;
-      }
+      // Левая стена
+      if (newX - PUCK_RADIUS < 0) {
+        gameState.puckPos.x = PUCK_RADIUS + 0.5; // Небольшой отступ от стены
+        gameState.puckVelocity.x =
+          -gameState.puckVelocity.x * BOARD_RESTITUTION;
 
-      collisionOccurred = true;
-    }
-    // Иначе обновить позицию X как обычно
-    else {
-      gameState.puckPos.x = newX;
-    }
-
-    // Верхняя стена/ворота
-    if (newY - PUCK_RADIUS < 0) {
-      // Проверить, находится ли в зоне ворот
-      if (newX > (width - GOAL_WIDTH) / 2 && newX < (width + GOAL_WIDTH) / 2) {
-        // Гол забит игроком 1
-        if (!match.goalCooldown && gameState.puckVelocity.y < 0) {
-          handleGoal(match, 1);
-          return true; // Гол забит, не продолжать физику
-        } else {
-          // Просто отскок, если это не действительный гол
-          gameState.puckPos.y = PUCK_RADIUS + 1;
-          gameState.puckVelocity.y =
-            -gameState.puckVelocity.y * BOARD_RESTITUTION;
-          collisionOccurred = true;
-        }
-      } else {
-        // Обычный отскок от стены
-        gameState.puckPos.y = PUCK_RADIUS + 1;
-        gameState.puckVelocity.y =
-          -gameState.puckVelocity.y * BOARD_RESTITUTION;
-
-        if (Math.abs(gameState.puckVelocity.y) < 2) {
-          gameState.puckVelocity.y = Math.sign(gameState.puckVelocity.y) * 2;
+        // Сохранить минимальную скорость отскока
+        if (Math.abs(gameState.puckVelocity.x) < 2) {
+          gameState.puckVelocity.x = Math.sign(gameState.puckVelocity.x) * 2;
         }
 
         collisionOccurred = true;
       }
-    }
+      // Правая стена
+      else if (newX + PUCK_RADIUS > width) {
+        gameState.puckPos.x = width - PUCK_RADIUS - 0.5;
+        gameState.puckVelocity.x =
+          -gameState.puckVelocity.x * BOARD_RESTITUTION;
 
-    // Нижняя стена/ворота
-    else if (newY + PUCK_RADIUS > height) {
-      // Проверить, находится ли в зоне ворот
-      if (newX > (width - GOAL_WIDTH) / 2 && newX < (width + GOAL_WIDTH) / 2) {
-        // Гол забит игроком 2
-        if (!match.goalCooldown && gameState.puckVelocity.y > 0) {
-          handleGoal(match, 2);
-          return true; // Гол забит, не продолжать физику
-        } else {
-          // Просто отскок, если это не действительный гол
-          gameState.puckPos.y = height - PUCK_RADIUS - 1;
-          gameState.puckVelocity.y =
-            -gameState.puckVelocity.y * BOARD_RESTITUTION;
-          collisionOccurred = true;
-        }
-      } else {
-        // Обычный отскок от стены
-        gameState.puckPos.y = height - PUCK_RADIUS - 1;
-        gameState.puckVelocity.y =
-          -gameState.puckVelocity.y * BOARD_RESTITUTION;
-
-        if (Math.abs(gameState.puckVelocity.y) < 2) {
-          gameState.puckVelocity.y = Math.sign(gameState.puckVelocity.y) * 2;
+        if (Math.abs(gameState.puckVelocity.x) < 2) {
+          gameState.puckVelocity.x = Math.sign(gameState.puckVelocity.x) * 2;
         }
 
         collisionOccurred = true;
       }
-    }
-    // Иначе обновить позицию Y как обычно
-    else {
-      gameState.puckPos.y = newY;
+      // Иначе обновить позицию X как обычно
+      else {
+        gameState.puckPos.x = newX;
+      }
+
+      // Верхняя стена/ворота
+      if (newY - PUCK_RADIUS < 0) {
+        // Проверить, находится ли в зоне ворот
+        if (
+          newX > (width - GOAL_WIDTH) / 2 &&
+          newX < (width + GOAL_WIDTH) / 2
+        ) {
+          // Гол забит игроком 1
+          if (!match.goalCooldown && gameState.puckVelocity.y < 0) {
+            handleGoal(match, 1);
+            return true; // Гол забит, не продолжать физику
+          } else {
+            // Просто отскок, если это не действительный гол
+            gameState.puckPos.y = PUCK_RADIUS + 0.5;
+            gameState.puckVelocity.y =
+              -gameState.puckVelocity.y * BOARD_RESTITUTION;
+            collisionOccurred = true;
+          }
+        } else {
+          // Обычный отскок от стены
+          gameState.puckPos.y = PUCK_RADIUS + 0.5;
+          gameState.puckVelocity.y =
+            -gameState.puckVelocity.y * BOARD_RESTITUTION;
+
+          if (Math.abs(gameState.puckVelocity.y) < 2) {
+            gameState.puckVelocity.y = Math.sign(gameState.puckVelocity.y) * 2;
+          }
+
+          collisionOccurred = true;
+        }
+      }
+      // Нижняя стена/ворота
+      else if (newY + PUCK_RADIUS > height) {
+        // Проверить, находится ли в зоне ворот
+        if (
+          newX > (width - GOAL_WIDTH) / 2 &&
+          newX < (width + GOAL_WIDTH) / 2
+        ) {
+          // Гол забит игроком 2
+          if (!match.goalCooldown && gameState.puckVelocity.y > 0) {
+            handleGoal(match, 2);
+            return true; // Гол забит, не продолжать физику
+          } else {
+            // Просто отскок, если это не действительный гол
+            gameState.puckPos.y = height - PUCK_RADIUS - 0.5;
+            gameState.puckVelocity.y =
+              -gameState.puckVelocity.y * BOARD_RESTITUTION;
+            collisionOccurred = true;
+          }
+        } else {
+          // Обычный отскок от стены
+          gameState.puckPos.y = height - PUCK_RADIUS - 0.5;
+          gameState.puckVelocity.y =
+            -gameState.puckVelocity.y * BOARD_RESTITUTION;
+
+          if (Math.abs(gameState.puckVelocity.y) < 2) {
+            gameState.puckVelocity.y = Math.sign(gameState.puckVelocity.y) * 2;
+          }
+
+          collisionOccurred = true;
+        }
+      }
+      // Иначе обновить позицию Y как обычно
+      else {
+        gameState.puckPos.y = newY;
+      }
     }
   }
 
-  // Добавить небольшую случайность к отскокам для большей реалистичности
+  // Ограничить скорость после столкновений
   if (collisionOccurred) {
-    const randomFactor = 1 + (Math.random() * 0.05 - 0.025); // ±2.5% вариация
-    gameState.puckVelocity.x *= randomFactor;
-    gameState.puckVelocity.y *= randomFactor;
-
-    // Ограничить скорость, чтобы предотвратить экстремальные скорости
     const speed = Math.sqrt(
       gameState.puckVelocity.x * gameState.puckVelocity.x +
         gameState.puckVelocity.y * gameState.puckVelocity.y
     );
 
-    const MAX_SPEED = 35;
     if (speed > MAX_SPEED) {
       const scaleFactor = MAX_SPEED / speed;
       gameState.puckVelocity.x *= scaleFactor;
       gameState.puckVelocity.y *= scaleFactor;
     }
+  }
+
+  // Добавить в историю позиций для интерполяции
+  match.positionHistory.puck.push({
+    pos: { ...gameState.puckPos },
+    timestamp: now,
+  });
+
+  // Ограничить историю
+  if (match.positionHistory.puck.length > 10) {
+    match.positionHistory.puck.shift();
   }
 
   return collisionOccurred;
@@ -406,7 +569,7 @@ function checkCornerCollision(x, y, radius, width, height) {
   return { collision: false };
 }
 
-// Обработка столкновений с углами
+// Улучшенная обработка столкновений с углами
 function handleCornerCollision(match, cornerName) {
   const { gameState } = match;
   const { width, height } = gameState.canvasSize;
@@ -445,8 +608,8 @@ function handleCornerCollision(match, cornerName) {
   const ny = dy / distance;
 
   // Переместить шайбу от угла на радиус + небольшой буфер
-  gameState.puckPos.x = cornerX + nx * (PUCK_RADIUS + 1);
-  gameState.puckPos.y = cornerY + ny * (PUCK_RADIUS + 1);
+  gameState.puckPos.x = cornerX + nx * (PUCK_RADIUS + 0.5);
+  gameState.puckPos.y = cornerY + ny * (PUCK_RADIUS + 0.5);
 
   // Вычислить скалярное произведение (проекция скорости на нормаль)
   const dotProduct =
@@ -461,17 +624,17 @@ function handleCornerCollision(match, cornerName) {
   const vty = gameState.puckVelocity.y - vny;
 
   // Новая скорость: сохранить тангенциальную компоненту, отразить нормальную компоненту
-  const CORNER_ELASTICITY = 0.8; // Немного пониженная эластичность для углов
+  const CORNER_ELASTICITY = 0.85; // Высокая эластичность для более плавных отскоков
   gameState.puckVelocity.x = vtx - vnx * CORNER_ELASTICITY;
   gameState.puckVelocity.y = vty - vny * CORNER_ELASTICITY;
 
   // Добавить небольшой случайный фактор для реалистичности
-  const randomFactor = 1 + (Math.random() * 0.1 - 0.05);
+  const randomFactor = 1 + (Math.random() * 0.05 - 0.025); // Уменьшенная случайность ±2.5%
   gameState.puckVelocity.x *= randomFactor;
   gameState.puckVelocity.y *= randomFactor;
 }
 
-// Обработка забитых голов
+// Улучшенная обработка забитых голов
 function handleGoal(match, scorer) {
   // Предотвратить забивание нескольких голов в быстрой последовательности
   const now = Date.now();
@@ -499,11 +662,11 @@ function handleGoal(match, scorer) {
   // Сбросить позиции и остановить шайбу
   resetPositions(match);
 
-  // Отправить обновление счета клиентам
+  // Отправить обновление счета клиентам с точными позициями
   io.to(match.id).emit("scoreUpdate", {
     player1Score: match.gameState.player1Score,
     player2Score: match.gameState.player2Score,
-    gameState: JSON.parse(JSON.stringify(match.gameState)),
+    gameState: match.gameState, // Отправляем копию без потери точности
     scorer,
   });
 
@@ -524,16 +687,25 @@ function handleGoal(match, scorer) {
         // Убедиться, что шайба находится точно в центре с нулевой скоростью
         const { width, height } = match.gameState.canvasSize;
         match.gameState.puckPos = {
-          x: Math.round(width / 2),
-          y: Math.round(height / 2),
+          x: width / 2,
+          y: height / 2,
         };
         match.gameState.puckVelocity = { x: 0, y: 0 };
 
-        // Сообщить клиентам о возобновлении игры
-        io.to(match.id).emit(
-          "resumeGame",
-          JSON.parse(JSON.stringify(match.gameState))
-        );
+        // Очистить историю позиций для чистого старта
+        match.positionHistory = {
+          puck: [
+            {
+              pos: { x: width / 2, y: height / 2 },
+              timestamp: Date.now(),
+            },
+          ],
+          player1: [],
+          player2: [],
+        };
+
+        // Сообщить клиентам о возобновлении игры с точными данными
+        io.to(match.id).emit("resumeGame", match.gameState);
       }
     }, 3000);
   }
@@ -541,7 +713,7 @@ function handleGoal(match, scorer) {
   return true;
 }
 
-// Запустить игровой цикл для конкретного матча
+// Запустить игровой цикл для конкретного матча с высокой частотой обновления
 function startGameLoop(matchId) {
   const match = matches.get(matchId);
   if (!match) return;
@@ -561,27 +733,42 @@ function startGameLoop(matchId) {
       // Обновить физику
       const collisionOccurred = updatePuckPhysics(match);
 
-      // Отправить компактное обновление клиентам
+      // Использовать интерполяцию для более плавного движения шайбы
+      let interpolatedPuckData = { ...match.gameState.puckPos };
+
+      // Применить предсказание движения на основе текущей скорости
+      // для компенсации сетевой задержки
+      if (
+        match.gameState.puckVelocity.x !== 0 ||
+        match.gameState.puckVelocity.y !== 0
+      ) {
+        interpolatedPuckData = {
+          x: match.gameState.puckPos.x + match.gameState.puckVelocity.x * 0.05, // Предсказание на 50 мс вперед
+          y: match.gameState.puckPos.y + match.gameState.puckVelocity.y * 0.05,
+        };
+      }
+
+      // Отправить компактное обновление клиентам с высокой точностью данных
       const updateData = {
-        p: {
-          x: Math.round(match.gameState.puckPos.x),
-          y: Math.round(match.gameState.puckPos.y),
-        },
-        v: {
-          x: Number(match.gameState.puckVelocity.x.toFixed(2)),
-          y: Number(match.gameState.puckVelocity.y.toFixed(2)),
-        },
+        p: interpolatedPuckData, // Отправляем плавающие точки без округления
+        v: match.gameState.puckVelocity, // Также отправляем точные значения скорости
         t: Date.now(), // Временная метка для интерполяции клиента
+        // Добавить флаги для клиентской интерполяции
+        interp: true,
+        collision: collisionOccurred,
       };
 
       io.to(matchId).emit("gameUpdate", updateData);
 
-      // Отправить полную синхронизацию периодически или при столкновении
-      if (collisionOccurred || Date.now() - match.lastSyncTime > 1000) {
+      // Отправить полную синхронизацию при столкновении или периодически
+      // с увеличенной частотой для лучшей согласованности
+      if (collisionOccurred || Date.now() - match.lastSyncTime > 500) {
+        // Каждые 500 мс вместо 1000 мс
         match.lastSyncTime = Date.now();
         io.to(matchId).emit("puckSync", {
           puckPos: match.gameState.puckPos,
           puckVelocity: match.gameState.puckVelocity,
+          timestamp: Date.now(),
         });
       }
     }
@@ -601,6 +788,25 @@ function stopGameLoop(matchId) {
 io.on("connection", socket => {
   console.log("Новое соединение:", socket.id);
 
+  // Измерение и установка задержки соединения
+  let pingStartTime = 0;
+
+  // Отправить пинг для измерения задержки
+  function sendPing() {
+    pingStartTime = Date.now();
+    socket.emit("ping");
+  }
+
+  // Настроить регулярное измерение задержки
+  const pingInterval = setInterval(sendPing, 5000);
+
+  // Обработчик понга от клиента
+  socket.on("pong", () => {
+    const latency = Date.now() - pingStartTime;
+    socket.latency = latency; // Сохранить задержку для этого клиента
+    socket.emit("latencyUpdate", { latency });
+  });
+
   // Присоединиться к существующему матчу
   socket.on("joinMatch", ({ matchId }, callback) => {
     // Получить или создать матч
@@ -617,6 +823,7 @@ io.on("connection", socket => {
       id: socket.id,
       number: playerNumber,
       ready: false,
+      latency: 0, // Начальная задержка
     });
 
     // Присоединиться к комнате Socket.IO
@@ -624,6 +831,7 @@ io.on("connection", socket => {
     socket.matchId = matchId;
     socket.playerNumber = playerNumber;
 
+    // Отправить информацию о успешном подключении
     callback({
       success: true,
       playerNumber,
@@ -640,6 +848,9 @@ io.on("connection", socket => {
     if (match.players.length === 2) {
       io.to(matchId).emit("matchReady");
     }
+
+    // Отправить начальный пинг
+    sendPing();
   });
 
   // Обработчик готовности игрока
@@ -674,16 +885,13 @@ io.on("connection", socket => {
     }
   });
 
-  // Движение игрока с регулированием
+  // Улучшенный обработчик движения игрока с адаптивным регулированием
   let lastMoveTime = 0;
-  const MOVE_THROTTLE_MS = 16; // ~60fps
+  let movementBuffer = [];
+  const MAX_BUFFER_SIZE = 5;
 
   socket.on("playerMove", ({ position, timestamp }) => {
     const now = Date.now();
-    // Ограничить обновления для уменьшения сетевого трафика
-    if (now - lastMoveTime < MOVE_THROTTLE_MS) return;
-    lastMoveTime = now;
-
     const matchId = socket.matchId;
     if (!matchId) return;
 
@@ -692,6 +900,42 @@ io.on("connection", socket => {
       return;
 
     const playerNumber = socket.playerNumber;
+
+    // Добавить в буфер движений
+    movementBuffer.push({ position, timestamp: now });
+    if (movementBuffer.length > MAX_BUFFER_SIZE) {
+      movementBuffer.shift();
+    }
+
+    // Адаптивная частота обновлений на основе скорости движения
+    const MOVE_THROTTLE_BASE = 16; // ~60fps
+
+    // Рассчитать скорость движения, если есть предыдущие данные
+    let movementSpeed = 0;
+    if (movementBuffer.length >= 2) {
+      const newest = movementBuffer[movementBuffer.length - 1];
+      const oldest = movementBuffer[0];
+      const dx = newest.position.x - oldest.position.x;
+      const dy = newest.position.y - oldest.position.y;
+      const dt = newest.timestamp - oldest.timestamp;
+      if (dt > 0) {
+        movementSpeed = Math.sqrt(dx * dx + dy * dy) / dt;
+      }
+    }
+
+    // Адаптировать частоту обновлений в зависимости от скорости
+    let throttleRate = MOVE_THROTTLE_BASE;
+    if (movementSpeed > 1.0) {
+      // Уменьшать задержку при быстром движении
+      throttleRate = Math.max(8, MOVE_THROTTLE_BASE - movementSpeed * 2);
+    } else if (movementSpeed < 0.1) {
+      // Увеличивать задержку при медленном движении для экономии ресурсов
+      throttleRate = Math.min(33, MOVE_THROTTLE_BASE + 10);
+    }
+
+    // Ограничить обновления для уменьшения сетевого трафика
+    if (now - lastMoveTime < throttleRate) return;
+    lastMoveTime = now;
 
     // Применить ограничения позиции
     const constrainedPosition = enforcePlayerConstraints(
@@ -703,22 +947,87 @@ io.on("connection", socket => {
     // Обновить позицию игрока
     if (playerNumber === 1) {
       match.gameState.player1Pos = constrainedPosition;
+
+      // Добавить в историю позиций
+      match.positionHistory.player1.push({
+        pos: { ...constrainedPosition },
+        timestamp: now,
+      });
+
+      // Ограничить размер истории
+      if (match.positionHistory.player1.length > 10) {
+        match.positionHistory.player1.shift();
+      }
     } else if (playerNumber === 2) {
       match.gameState.player2Pos = constrainedPosition;
+
+      // Добавить в историю позиций
+      match.positionHistory.player2.push({
+        pos: { ...constrainedPosition },
+        timestamp: now,
+      });
+
+      // Ограничить размер истории
+      if (match.positionHistory.player2.length > 10) {
+        match.positionHistory.player2.shift();
+      }
     }
 
-    // Отправить обновление другому игроку в компактном формате
+    // Отправить обновление другому игроку с точными координатами
     socket.to(matchId).emit("opponentMove", {
       playerNumber,
-      position: {
-        x: Math.round(constrainedPosition.x),
-        y: Math.round(constrainedPosition.y),
-      },
+      position: constrainedPosition, // Отправляем оригинальные координаты без округления
+      timestamp: now,
+      // Добавить информацию о скорости для предсказания на клиенте
+      velocity: calculateVelocity(
+        playerNumber === 1
+          ? match.positionHistory.player1
+          : match.positionHistory.player2
+      ),
     });
+
+    // Пока соединение активно, проверим столкновение шайбы с игроком
+    if (match.gameState.isPlaying) {
+      const collision = checkPuckPlayerCollision(
+        match.gameState.puckPos,
+        constrainedPosition
+      );
+
+      if (collision) {
+        // Обработать столкновение
+        const collisionOccurred = handlePlayerCollision(match, playerNumber);
+
+        if (collisionOccurred) {
+          // Немедленно отправить обновление шайбы всем клиентам
+          io.to(matchId).emit("puckSync", {
+            puckPos: match.gameState.puckPos,
+            puckVelocity: match.gameState.puckVelocity,
+            timestamp: now,
+            collision: true,
+          });
+        }
+      }
+    }
   });
 
-  // Обновление позиции шайбы с сервера
-  socket.on("puckUpdate", ({ puckPos, puckVelocity }) => {
+  // Вспомогательная функция для расчета скорости на основе истории позиций
+  function calculateVelocity(positionHistory) {
+    if (positionHistory.length < 2) return { x: 0, y: 0 };
+
+    const newest = positionHistory[positionHistory.length - 1];
+    const oldest = positionHistory[positionHistory.length - 2];
+    const dt = (newest.timestamp - oldest.timestamp) / 1000;
+
+    if (dt <= 0) return { x: 0, y: 0 };
+
+    return {
+      x: (newest.pos.x - oldest.pos.x) / dt,
+      y: (newest.pos.y - oldest.pos.y) / dt,
+    };
+  }
+
+  // Обновление позиции шайбы с клиента (используется для корректировок)
+  socket.on("puckUpdate", ({ puckPos, puckVelocity, timestamp }) => {
     const matchId = socket.matchId;
     if (!matchId) return;
 
@@ -726,19 +1035,40 @@ io.on("connection", socket => {
     if (!match || !match.gameState.isPlaying || match.gameState.gameOver)
       return;
 
-    // Обновить позицию и скорость шайбы с некоторыми ограничениями
+    // Проверка времени задержки обновления
+    const now = Date.now();
+    const updateAge = now - timestamp;
+
+    // Игнорировать устаревшие обновления (старше 200 мс)
+    if (updateAge > 200) return;
+
+    // Для недавних обновлений применить плавное смешивание с серверным состоянием
+    const blendFactor = 0.3; // 30% от клиентского обновления, 70% от серверного состояния
+
+    // Обновить позицию и скорость шайбы с применением смешивания
     match.gameState.puckPos = {
-      x: Math.round(puckPos.x),
-      y: Math.round(puckPos.y),
+      x:
+        match.gameState.puckPos.x * (1 - blendFactor) + puckPos.x * blendFactor,
+      y:
+        match.gameState.puckPos.y * (1 - blendFactor) + puckPos.y * blendFactor,
     };
 
     match.gameState.puckVelocity = {
-      x: Number(puckVelocity.x.toFixed(2)),
-      y: Number(puckVelocity.y.toFixed(2)),
+      x:
+        match.gameState.puckVelocity.x * (1 - blendFactor) +
+        puckVelocity.x * blendFactor,
+      y:
+        match.gameState.puckVelocity.y * (1 - blendFactor) +
+        puckVelocity.y * blendFactor,
     };
 
-    // Широковещательное обновление для всех игроков в матче, кроме отправителя
-    socket.to(matchId).emit("puckSync", { puckPos, puckVelocity });
+    // Синхронизация для других клиентов
+    socket.to(matchId).emit("puckSync", {
+      puckPos: match.gameState.puckPos,
+      puckVelocity: match.gameState.puckVelocity,
+      timestamp: now,
+      clientSync: true, // Флаг, что это синхронизация от клиента
+    });
   });
 
   // Обработчик для сброса игры
@@ -753,14 +1083,14 @@ io.on("connection", socket => {
     resetGame(match);
 
     // Уведомить всех игроков о сбросе
-    io.to(matchId).emit(
-      "gameReset",
-      JSON.parse(JSON.stringify(match.gameState))
-    );
+    io.to(matchId).emit("gameReset", match.gameState);
   });
 
   // Обработчик разрыва соединения
   socket.on("disconnect", () => {
+    // Очистить интервал пинга
+    clearInterval(pingInterval);
+
     const matchId = socket.matchId;
     if (!matchId) return;
 
@@ -811,7 +1141,7 @@ io.on("connection", socket => {
 });
 
 // Запуск сервера
-const PORT = process.env.PORT || 3001;
+const PORT = 3001;
 server.listen(PORT, () => {
   console.log(`Сервер запущен на порту ${PORT}`);
 });
