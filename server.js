@@ -51,7 +51,21 @@ const AIR_RESISTANCE = 0.9998; // Уменьшенное сопротивлен�
 const BOARD_RESTITUTION = 0.97; // Увеличенное сохранение энергии при отскоке
 const MIN_VELOCITY = 0.2; // Меньший порог минимальной скорости
 const MAX_SPEED = 30; // Максимальная скорость шайбы
-const UPDATE_RATE = 16; // ~60 FPS для максимальной плавности (16.67ms)
+const UPDATE_RATE = 10000; // ~60 FPS для максимальной плавности (16.67ms)
+
+app.get("/test", (req, res) => {
+  res.json({
+    status: "success",
+    message: "Air Hockey API работает",
+    timestamp: Date.now(),
+    activeMatches: matches.size,
+    serverInfo: {
+      version: "1.0.0",
+      uptime: process.uptime(),
+      memoryUsage: process.memoryUsage(),
+    },
+  });
+});
 
 // Получить или создать матч по ID
 function getOrCreateMatch(matchId) {
@@ -1141,7 +1155,7 @@ io.on("connection", socket => {
 });
 
 // Запуск сервера
-const PORT = 3001;
+const PORT = 3002;
 server.listen(PORT, () => {
   console.log(`Сервер запущен на порту ${PORT}`);
 });
